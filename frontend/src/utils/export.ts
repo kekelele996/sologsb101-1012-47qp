@@ -12,22 +12,44 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import type { Requisition, StockInstrument, UpgradeIssue } from '@/types/warehouse';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
-/** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+/** 备份集合键名（v3：含器材库三表） */
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'stockInstruments',
+  'requisitions',
+  'upgradeIssues',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [
+    arrays,
+    stations,
+    instruments,
+    calibrations,
+    replaces,
+    stockInstruments,
+    requisitions,
+    upgradeIssues,
+  ] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.stockInstruments.toArray(),
+    db.requisitions.toArray(),
+    db.upgradeIssues.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +60,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    stockInstruments,
+    requisitions,
+    upgradeIssues,
   };
 }
 
@@ -68,6 +93,9 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    stockInstruments: obj.stockInstruments ?? [],
+    requisitions: obj.requisitions ?? [],
+    upgradeIssues: obj.upgradeIssues ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +108,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    stockInstruments: payload.stockInstruments.length,
+    requisitions: payload.requisitions.length,
+    upgradeIssues: payload.upgradeIssues.length,
   };
 }
 
@@ -117,13 +148,25 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.stockInstruments,
+      db.requisitions,
+      db.upgradeIssues,
+    ],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.stockInstruments.bulkPut(payload.stockInstruments);
+      await db.requisitions.bulkPut(payload.requisitions);
+      await db.upgradeIssues.bulkPut(payload.upgradeIssues);
     }
   );
   return countPayload(payload);
@@ -148,7 +191,15 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const instruments = payload.instruments.map((row) => {
     const id = createId('ins');
     instrumentMap.set(row.id, id);
-    return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
+    return {
+      ...row,
+      id,
+      stationId: stationMap.get(row.stationId) ?? row.stationId,
+      // 跨域溯源的领用单 id 在追加导入时解链，保留序列号/台站码供重新对账
+      requisitionId: null,
+      reconcileResult: null,
+      reconcileNote: '',
+    };
   });
   const calibrations = payload.calibrations.map((row) => ({
     ...row,
@@ -160,7 +211,31 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  // 器材库三表按主键重映射；领用单与安装位的溯源关系解链，以台站码 + 序列号重新对账
+  const stockInstruments: StockInstrument[] = payload.stockInstruments.map((row) => ({
+    ...row,
+    id: createId('stk'),
+    requisitionId: null,
+  }));
+  const requisitions: Requisition[] = payload.requisitions.map((row) => ({
+    ...row,
+    id: createId('rqy'),
+  }));
+  const upgradeIssues: UpgradeIssue[] = payload.upgradeIssues.map((row) => ({
+    ...row,
+    id: createId('iss'),
+  }));
+  return {
+    ...payload,
+    arrays,
+    stations,
+    instruments,
+    calibrations,
+    replaces,
+    stockInstruments,
+    requisitions,
+    upgradeIssues,
+  };
 }
 
 /** 按台阵汇总的几何与标定结论 */

@@ -8,6 +8,7 @@ import { Badge, Button, Layout, Menu, Space, Tag, Typography, message } from 'an
 import {
   AppstoreOutlined,
   DashboardOutlined,
+  DatabaseOutlined,
   ExperimentOutlined,
   GlobalOutlined,
   SwapOutlined,
@@ -30,12 +31,20 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import {
+  selectRequisitions,
+  selectStock,
+  selectUpgradeIssues,
+  startWarehouseSubscription,
+} from '@/stores/warehouseSlice';
+import { isOpenRequisition } from '@/types/warehouse';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 /** 按当前路径决定导航高亮项 */
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
+  if (pathname.startsWith('/warehouse')) return ROUTES.warehouse;
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
@@ -54,6 +63,9 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const stock = useAppSelector(selectStock);
+  const requisitions = useAppSelector(selectRequisitions);
+  const upgradeIssues = useAppSelector(selectUpgradeIssues);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +79,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startWarehouseSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -83,6 +96,10 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const inStock = stock.filter((row) => row.state === '在库').length;
+  const queued = stock.filter((row) => row.state === '排队中').length;
+  const openReqCount = requisitions.filter((row) => isOpenRequisition(row.state)).length;
+  const unresolvedIssues = upgradeIssues.filter((row) => !row.resolved).length;
 
   return (
     <>
@@ -113,9 +130,10 @@ export default function App() {
               {
                 key: currentArrayId ? ROUTES.stations(currentArrayId) : 'stations-disabled',
                 icon: <ExperimentOutlined />,
-                label: currentArray ? `台站仪器 · ${currentArray.name}` : '台站仪器（先选台阵）',
+                label: currentArray ? `安装位 · ${currentArray.name}` : '台站安装位（先选台阵）',
                 disabled: !currentArrayId,
               },
+              { key: ROUTES.warehouse, icon: <DatabaseOutlined />, label: '器材库（在库/领用单/对账）' },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
@@ -127,13 +145,17 @@ export default function App() {
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
               </span>
               <span>
-                <ExperimentOutlined /> 仪器 {instruments.length}
+                <ExperimentOutlined /> 安装位 {instruments.length}
+              </span>
+              <span>
+                <DatabaseOutlined /> 在库 {inStock} · 排队 {queued} · 未回收单 {openReqCount}
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
+                {unresolvedIssues > 0 ? ` · 补单遗留 ${unresolvedIssues}` : ''}
               </span>
             </Space>
           </div>

@@ -115,7 +115,7 @@ export default function CalibrationBoard() {
   const instrumentIndex = useMemo(() => {
     const map = new Map<
       string,
-      { model: string; type: string; serialNo: string; stationCode: string; arrayName: string; arrayId: string }
+      { model: string; type: string; serialNo: string | null; stationCode: string; arrayName: string; arrayId: string }
     >();
     instruments.forEach((instrument) => {
       const station = stations.find((row) => row.id === instrument.stationId);
@@ -158,7 +158,7 @@ export default function CalibrationBoard() {
           row,
           instrumentModel: info?.model ?? '仪器已删除',
           instrumentType: info?.type ?? '未知',
-          serialNo: info?.serialNo ?? '—',
+          serialNo: info?.serialNo ?? '—（待发料）',
           stationCode: info?.stationCode ?? '—',
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
@@ -168,7 +168,7 @@ export default function CalibrationBoard() {
       .filter((item) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
-          const haystack = `${item.instrumentModel}${item.serialNo}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
+          const haystack = `${item.instrumentModel}${item.serialNo ?? ''}${item.stationCode}${item.arrayName}${item.row.operator}${item.row.agency}`;
           if (!haystack.includes(keyword)) return false;
         }
         if (filter.verdicts.length > 0 && !filter.verdicts.includes(item.row.responseVerdict)) return false;
@@ -545,7 +545,7 @@ export default function CalibrationBoard() {
             value={trendRows.targetId ?? undefined}
             onChange={(value) => setTrendInstrumentId(value)}
             options={instruments.map((instrument) => ({
-              label: `${instrument.model}（${instrument.serialNo}）`,
+              label: `${instrument.model}（${instrument.serialNo ?? '待发料'}）`,
               value: instrument.id,
             }))}
           />
@@ -608,7 +608,7 @@ export default function CalibrationBoard() {
               options={instruments.map((instrument) => {
                 const info = instrumentIndex.get(instrument.id);
                 return {
-                  label: `${info?.arrayName ?? ''} / ${info?.stationCode ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
+                  label: `${info?.arrayName ?? ''} / ${info?.stationCode ?? ''} · ${instrument.model}（${instrument.serialNo ?? '待发料'}）`,
                   value: instrument.id,
                 };
               })}

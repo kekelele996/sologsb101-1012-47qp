@@ -134,7 +134,7 @@ export default function ReplaceBoard() {
       .filter((row) => {
         const keyword = filter.keyword.trim();
         if (keyword.length > 0) {
-          const haystack = `${row.instrument.model}${row.instrument.serialNo}${row.stationCode}${row.arrayName}`;
+          const haystack = `${row.instrument.model}${row.instrument.serialNo ?? ''}${row.stationCode}${row.arrayName}`;
           if (!haystack.includes(keyword)) return false;
         }
         if (filter.arrayIds.length > 0 && !filter.arrayIds.includes(row.arrayId)) return false;
@@ -304,7 +304,7 @@ export default function ReplaceBoard() {
             .slice(0, 5)
             .map(
               (history) =>
-                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo}）已超期 ${Math.abs(history.dueInDays)} 天`
+                `${history.arrayName} / ${history.stationCode} · ${history.instrument.model}（${history.instrument.serialNo ?? '待发料'}）已超期 ${Math.abs(history.dueInDays)} 天`
             )
             .join('；')}
         />
@@ -356,7 +356,9 @@ export default function ReplaceBoard() {
                   <div>
                     {row.instrument.model} <Tag>{row.instrument.type}</Tag>
                   </div>
-                  <div className="gb-hint gb-mono">{row.instrument.serialNo}</div>
+                  <div className="gb-hint gb-mono">
+                    {row.instrument.serialNo ?? <Tag color="orange">待发料</Tag>}
+                  </div>
                 </div>
               ),
             },
@@ -558,7 +560,7 @@ export default function ReplaceBoard() {
               options={instruments.map((instrument) => {
                 const station = stations.find((row) => row.id === instrument.stationId);
                 return {
-                  label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo}）`,
+                  label: `${station?.code ?? ''} · ${instrument.model}（${instrument.serialNo ?? '待发料'}）`,
                   value: instrument.id,
                 };
               })}

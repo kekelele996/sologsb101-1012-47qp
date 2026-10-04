@@ -52,7 +52,16 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  stockInstruments: 0,
+  requisitions: 0,
+  upgradeIssues: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +71,9 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const stock = useAppSelector((state) => state.warehouse.stock);
+  const requisitions = useAppSelector((state) => state.warehouse.requisitions);
+  const upgradeIssues = useAppSelector((state) => state.warehouse.issues);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +98,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, stock, requisitions, upgradeIssues]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +118,12 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      stockInstruments: stock,
+      requisitions,
+      upgradeIssues,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, replaces, stations, stock, requisitions, upgradeIssues]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -281,9 +296,12 @@ export default function GeometryView() {
       <div className="gb-stats-row">
         <StatBadge label="台阵" value={counts.arrays} suffix="个" tone="primary" />
         <StatBadge label="台站" value={counts.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
+        <StatBadge label="安装位" value={counts.instruments} suffix="个" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="在库仪器" value={counts.stockInstruments} suffix="台" tone="info" />
+        <StatBadge label="领用单" value={counts.requisitions} suffix="张" tone="primary" />
+        <StatBadge label="补单遗留" value={counts.upgradeIssues} suffix="条" tone={counts.upgradeIssues > 0 ? 'danger' : 'success'} />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -503,15 +521,18 @@ export default function GeometryView() {
             <Descriptions.Item label="结构版本">v{DB_VERSION}</Descriptions.Item>
             <Descriptions.Item label="浏览器记录版本">v{stampedVersion}</Descriptions.Item>
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
-            <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
+            <Descriptions.Item label="安装位 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
             <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
-            <Descriptions.Item label="最近备份时间" span={3}>
+            <Descriptions.Item label="在库 / 领用单">{counts.stockInstruments} / {counts.requisitions}</Descriptions.Item>
+            <Descriptions.Item label="补单遗留">{counts.upgradeIssues}</Descriptions.Item>
+            <Descriptions.Item label="最近备份时间">
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含中心三表（arrays / stations / instruments）、标定两表（calibrations / replaces）
+            与器材库三表（stockInstruments / requisitions / upgradeIssues）共八张表。
           </p>
         </Space>
       </Card>

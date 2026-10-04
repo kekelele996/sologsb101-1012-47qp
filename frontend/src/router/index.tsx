@@ -1,5 +1,5 @@
 /**
- * 路由表：/arrays、/stations/:id/instruments、/calibrations、/replacements、/geometry
+ * 路由表：/arrays、/stations/:id/instruments、/warehouse、/calibrations、/replacements、/geometry
  * 路径与提示词逐字一致；页面按路由懒加载，构建时自动分包。
  */
 import { Suspense, lazy, type ReactNode } from 'react';
@@ -9,6 +9,7 @@ import App from '@/App';
 
 const ArrayList = lazy(() => import('@/pages/ArrayList'));
 const StationInstruments = lazy(() => import('@/pages/StationInstruments'));
+const WarehouseBoard = lazy(() => import('@/pages/WarehouseBoard'));
 const CalibrationBoard = lazy(() => import('@/pages/CalibrationBoard'));
 const ReplaceBoard = lazy(() => import('@/pages/ReplaceBoard'));
 const GeometryView = lazy(() => import('@/pages/GeometryView'));
@@ -32,6 +33,7 @@ function withSuspense(node: ReactNode): ReactNode {
 export const ROUTES = {
   arrays: '/arrays',
   stations: (arrayId: string): string => `/stations/${arrayId}/instruments`,
+  warehouse: '/warehouse',
   calibrations: '/calibrations',
   replacements: '/replacements',
   geometry: '/geometry',
@@ -45,6 +47,7 @@ export const appRoutes: RouteObject[] = [
       { index: true, element: <Navigate to={ROUTES.arrays} replace /> },
       { path: 'arrays', element: withSuspense(<ArrayList />) },
       { path: 'stations/:id/instruments', element: withSuspense(<StationInstruments />) },
+      { path: 'warehouse', element: withSuspense(<WarehouseBoard />) },
       { path: 'calibrations', element: withSuspense(<CalibrationBoard />) },
       { path: 'replacements', element: withSuspense(<ReplaceBoard />) },
       { path: 'geometry', element: withSuspense(<GeometryView />) },
