@@ -72,7 +72,7 @@ interface AssessmentRow {
   stationCode: string;
   arrayId: string;
   arrayName: string;
-  lastDate: string;
+  lastDate: string | null;
   dueInDays: number;
   overdue: boolean;
   lastVerdict: string;

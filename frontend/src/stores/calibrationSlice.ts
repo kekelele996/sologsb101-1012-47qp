@@ -133,7 +133,8 @@ export const updateReplace = createAsyncThunk(
 
 /**
  * 推进更换状态机：
- * 流转到「已更换」时回写仪器序列号并置为在用（更换完成后回写仪器序列号并归档旧记录）。
+ * 流转到「已更换」时回写仪器序列号并置为在用（更换完成后回写仪器序列号并归档旧记录）；
+ * 同时走台账拆分：旧序列号的未回收领用单回收、安装位拆回，新序列号按台站码开领用单上站。
  */
 export const transitionReplace = createAsyncThunk(
   'calibration/transitionReplace',
@@ -147,17 +148,105 @@ export const transitionReplace = createAsyncThunk(
       return rejectWithValue(`状态机不允许从「${replace.state}」流转到「${payload.next}」`);
     }
     const now = Date.now();
-    await db.transaction('rw', [db.replaces, db.instruments], async () => {
-      await db.replaces.update(payload.id, { state: payload.next, updatedAt: now } as never);
-      if (payload.next === '已更换' && replace.newSerialNo) {
-        await db.instruments.update(replace.instrumentId, {
-          serialNo: replace.newSerialNo,
-          state: '在用',
-          updatedAt: now,
-        } as never);
+    const today = new Date(now).toISOString().slice(0, 10);
+    try {
+      await db.transaction(
+        'rw',
+        [db.replaces, db.instruments, db.requisitions, db.installations, db.stations],
+        async () => {
+        await db.replaces.update(payload.id, { state: payload.next, updatedAt: now } as never);
+        if (payload.next === '已更换' && replace.newSerialNo) {
+          const instrument = await db.instruments.get(replace.instrumentId);
+          if (instrument) {
+            const oldSerial = instrument.serialNo;
+            // 同一台仪器不能同时挂在两张没回收的单上：新序列号若已挂未回收单则拒绝
+            const newOpen = await db.requisitions
+              .where('serialNo')
+              .equals(replace.newSerialNo)
+              .filter((row) => row.state === '已发料')
+              .first();
+            if (newOpen) {
+              throw new Error(
+                `新序列号「${replace.newSerialNo}」已挂领用单 ${newOpen.requisitionNo}，不能重复上站`
+              );
+            }
+            // 回收旧序列号的未回收领用单，拆回其安装位
+            const oldOpen = await db.requisitions
+              .where('serialNo')
+              .equals(oldSerial)
+              .filter((row) => row.state === '已发料')
+              .first();
+            if (oldOpen) {
+              await db.requisitions.update(oldOpen.id, {
+                state: '已回收',
+                recoveredAt: today,
+                updatedAt: now,
+              } as never);
+              const oldInst = await db.installations
+                .where('serialNo')
+                .equals(oldSerial)
+                .filter((row) => row.state === '在装')
+                .first();
+              if (oldInst) {
+                await db.installations.update(oldInst.id, { state: '已拆回', updatedAt: now } as never);
+              }
+            }
+            // 新序列号按台站码开领用单上站（台站码取仪器回显台站）
+            const station = instrument.stationId
+              ? await db.stations.get(instrument.stationId)
+              : undefined;
+            const stationCode = station?.code ?? '';
+            const requisitionNo = `LYD${today.replace(/-/g, '')}-${Math.random()
+              .toString(36)
+              .slice(2, 6)
+              .toUpperCase()}`;
+            await db.requisitions.put({
+              id: `lyr_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              requisitionNo,
+              stationCode,
+              serialNo: replace.newSerialNo,
+              issueDate: today,
+              state: '已发料',
+              backfilled: false,
+              recoveredAt: null,
+              remark: `更换上站（原序列号 ${oldSerial}）`,
+              createdAt: now,
+              updatedAt: now,
+            });
+            if (stationCode) {
+              await db.installations.put({
+                id: `ist_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+                stationId: instrument.stationId ?? '',
+                stationCode,
+                serialNo: replace.newSerialNo,
+                installDate: today,
+                requisitionNo,
+                state: '在装',
+                acknowledged: false,
+                acknowledgedAt: null,
+                remark: '更换上站安装位',
+                createdAt: now,
+                updatedAt: now,
+              });
+            }
+            // 回写仪器档案：序列号更新、置为在用、已安装
+            await db.instruments.update(instrument.id, {
+              serialNo: replace.newSerialNo,
+              state: '在用',
+              stationId: instrument.stationId,
+              installDate: today,
+              logisticsState: '已安装',
+              requisitionNo,
+              updatedAt: now,
+            } as never);
+          }
+        }
       }
-    });
+    );
     return payload;
+    } catch (error) {
+      return rejectWithValue(error instanceof Error ? error.message : '更换状态流转失败');
+    }
   }
 );
 

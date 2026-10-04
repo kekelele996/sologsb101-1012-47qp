@@ -127,7 +127,9 @@ export default function ArrayList() {
       filtered.map((row) => {
         const arrayStations = stations.filter((station) => station.arrayId === row.id);
         const stationIds = new Set(arrayStations.map((station) => station.id));
-        const arrayInstruments = instruments.filter((instrument) => stationIds.has(instrument.stationId));
+        const arrayInstruments = instruments.filter(
+          (instrument) => instrument.stationId != null && stationIds.has(instrument.stationId)
+        );
         const instrumentIds = new Set(arrayInstruments.map((instrument) => instrument.id));
         const arrayCalibrations = calibrations.filter((calibration) =>
           instrumentIds.has(calibration.instrumentId)

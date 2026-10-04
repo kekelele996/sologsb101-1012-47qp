@@ -12,9 +12,14 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Requisition } from '@/types/warehouse';
+import { createRequisitionNo } from '@/types/warehouse';
+import type { Installation } from '@/types/installation';
+import type { ReconciliationRecord } from '@/types/reconciliation';
+import { backfillForLegacyInstrument, computeReconciliation } from '@/utils/ledger';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -24,7 +29,20 @@ export const LS_KEYS = {
   dbVersion: 'gbseisarray:db-version',
   lastBackupAt: 'gbseisarray:last-backup-at',
   lastArrayId: 'gbseisarray:last-array-id',
+  backfillReport: 'gbseisarray:backfill-report',
 } as const;
+
+/** 升级补单报告（旧数据无领用单，升级时按安装日期补出，补不出来的列出来） */
+export interface BackfillReport {
+  /** 应补台数（有安装位的旧仪器数） */
+  total: number;
+  /** 成功补出台数 */
+  done: number;
+  /** 补不出来的清单 */
+  failures: Array<{ serialNo: string; stationCode: string; installDate: string; reason: string }>;
+  /** 补单时间（ISO 时间戳） */
+  at: string;
+}
 
 /** 备份文件结构，供 utils/export.ts 与几何页使用 */
 export interface BackupPayload {
@@ -36,6 +54,12 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  /** 器材库领用单 */
+  requisitions: Requisition[];
+  /** 台网中心仪器安装位 */
+  installations: Installation[];
+  /** 对账记录 */
+  reconciliations: ReconciliationRecord[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +68,12 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  /** 器材库：领用单 */
+  requisitions!: Table<Requisition, string>;
+  /** 台网中心：仪器安装位 */
+  installations!: Table<Installation, string>;
+  /** 两边对账记录 */
+  reconciliations!: Table<ReconciliationRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,20 +88,47 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
+    this.version(2).stores({
+      arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+      stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+      instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+      calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+      replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+    });
+
+    // v3：台账拆分——器材库管在库仪器（入库日期/物流状态）与领用单，
+    // 台网中心管安装位；两边按台站码 + 序列号对账。旧数据无领用单，升级时按安装日期补出。
     this.version(DB_VERSION)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
-        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        instruments:
+          'id, stationId, type, model, serialNo, installDate, state, logisticsState, stockInDate, requisitionNo, updatedAt',
         calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
         replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        requisitions:
+          'id, requisitionNo, stationCode, serialNo, issueDate, state, backfilled, recoveredAt, updatedAt',
+        installations:
+          'id, stationId, stationCode, serialNo, installDate, requisitionNo, state, acknowledged, updatedAt',
+        reconciliations: 'id, stationCode, serialNo, result, failCount, lastAttemptAt, updatedAt',
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与必填字段，避免列表排序与筛选拿到 undefined
+        // v2 迁移：历史数据补齐时间戳与必填字段
         const defaults: Array<[string, () => Record<string, unknown>]> = [
           ['arrays', () => ({ apertureKm: 0, stationCount: 0, department: '' })],
           ['stations', () => ({ lat: 0, lng: 0, elevM: 0, bedrock: '花岗岩', siteNote: '' })],
-          ['instruments', () => ({ type: '宽频带', model: '', state: '在用', remark: '' })],
+          [
+            'instruments',
+            () => ({
+              type: '宽频带',
+              model: '',
+              state: '在用',
+              remark: '',
+              logisticsState: '已安装',
+              requisitionNo: null,
+              stockInDate: '',
+            }),
+          ],
           ['calibrations', () => ({ sensitivity: 0, selfNoise: 0, responseVerdict: '待判定', agency: '' })],
           ['replaces', () => ({ state: '待更换', newSerialNo: '', operator: '' })],
         ];
@@ -86,11 +143,98 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+
+        // v3 补单：旧数据领料和上站挤在一份记录里，没有领用单，
+        // 升级时按安装日期补出领用单与安装位；补不出来的列入失败清单。
+        const report = await backfillLegacyLedger(tx);
+        stampBackfillReport(report);
       });
   }
 }
 
 export const db = new SeisArrayDatabase();
+
+/**
+ * v3 升级补单：旧数据领料和上站挤在仪器一份记录里、没有领用单，
+ * 按安装日期补出器材库领用单与台网中心安装位；补不出来的（缺台站 / 台站码 /
+ * 序列号 / 安装日期）列入失败清单，供升级后人工核对。幂等：已补过的不重复补。
+ */
+async function backfillLegacyLedger(tx: Dexie.Transaction): Promise<BackfillReport> {
+  const now = Date.now();
+  const [instruments, stations] = await Promise.all([
+    tx.table('instruments').toArray() as Promise<Instrument[]>,
+    tx.table('stations').toArray() as Promise<SeisStation[]>,
+  ]);
+  const stationById = new Map(stations.map((station) => [station.id, station]));
+  const failures: BackfillReport['failures'] = [];
+  let done = 0;
+
+  for (const instrument of instruments) {
+    // 无安装位的是在库 / 排队仪器，不涉及补单
+    if (!instrument.stationId) continue;
+    const station = stationById.get(instrument.stationId);
+    const stationCode = station?.code ?? '';
+    const result = backfillForLegacyInstrument({ instrument, stationCode: stationCode || null, now });
+    if (!result.ok || !result.requisition || !result.installation) {
+      failures.push({
+        serialNo: instrument.serialNo || '（缺序列号）',
+        stationCode: stationCode || '（缺台站码）',
+        installDate: instrument.installDate || '（缺安装日期）',
+        reason: result.reason,
+      });
+      continue;
+    }
+    // 幂等：同序列号 + 同台站码已有安装位则跳过
+    const existing = (await tx
+      .table('installations')
+      .where('serialNo')
+      .equals(instrument.serialNo)
+      .toArray()) as Installation[];
+    if (existing.some((row) => row.stationCode === stationCode)) {
+      done += 1;
+      continue;
+    }
+    await tx.table('requisitions').put(result.requisition);
+    await tx.table('installations').put(result.installation);
+    await tx.table('instruments').update(instrument.id, {
+      stockInDate: instrument.installDate,
+      logisticsState: '已安装',
+      requisitionNo: result.requisition.requisitionNo,
+      updatedAt: now,
+    });
+    done += 1;
+  }
+
+  return { total: done + failures.length, done, failures, at: new Date(now).toISOString() };
+}
+
+/** 写入升级补单报告到 localStorage，供器材库 / 对账页展示 */
+export function stampBackfillReport(report: BackfillReport): void {
+  try {
+    localStorage.setItem(LS_KEYS.backfillReport, JSON.stringify(report));
+  } catch {
+    // 忽略
+  }
+}
+
+export function readBackfillReport(): BackfillReport | null {
+  try {
+    const raw = localStorage.getItem(LS_KEYS.backfillReport);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BackfillReport;
+    return Array.isArray(parsed?.failures) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearBackfillReport(): void {
+  try {
+    localStorage.removeItem(LS_KEYS.backfillReport);
+  } catch {
+    // 忽略
+  }
+}
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -490,7 +634,16 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.requisitions,
+      db.installations,
+      db.reconciliations,
+    ],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -512,6 +665,9 @@ export async function seedDemoData(): Promise<void> {
             const { calibrations, ...instrumentRest } = instrumentSeed;
             instrumentRows.push({
               ...instrumentRest,
+              stockInDate: instrumentRest.installDate,
+              logisticsState: '已安装',
+              requisitionNo: null,
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
             });
             calibrations.forEach((calibrationSeed, calibrationIndex) => {
@@ -532,11 +688,135 @@ export async function seedDemoData(): Promise<void> {
         });
       });
 
+      // 台账拆分：8 台已安装仪器补出器材库领用单（LYB 补单前缀）与台网中心安装位
+      const requisitionRows: Requisition[] = [];
+      const installationRows: Installation[] = [];
+      instrumentRows.forEach((instrument) => {
+        if (!instrument.stationId) return;
+        const station = stationRows.find((row) => row.id === instrument.stationId);
+        if (!station) return;
+        const requisitionNo = createRequisitionNo('LYB', instrument.installDate ?? today);
+        requisitionRows.push({
+          id: createId('lyr'),
+          requisitionNo,
+          stationCode: station.code,
+          serialNo: instrument.serialNo,
+          issueDate: instrument.installDate ?? today,
+          state: '已发料',
+          backfilled: true,
+          recoveredAt: null,
+          remark: '升级补单（旧数据无领用单，按安装日期补出）',
+          createdAt: now,
+          updatedAt: now,
+        });
+        installationRows.push({
+          id: createId('ist'),
+          stationId: instrument.stationId,
+          stationCode: station.code,
+          serialNo: instrument.serialNo,
+          installDate: instrument.installDate ?? today,
+          requisitionNo,
+          state: '在装',
+          acknowledged: false,
+          acknowledgedAt: null,
+          remark: '升级补登安装位',
+          createdAt: now,
+          updatedAt: now,
+        });
+        instrument.requisitionNo = requisitionNo;
+      });
+
+      // 器材库另有 3 台未上站仪器：1 台在库、1 台已发料待上站、1 台排队等下一批
+      const openReqNo = createRequisitionNo('LYD', today);
+      requisitionRows.push({
+        id: createId('lyr'),
+        requisitionNo: openReqNo,
+        stationCode: 'LTX03',
+        serialNo: 'CMG-3E-20250601-99',
+        issueDate: today,
+        state: '已发料',
+        backfilled: false,
+        recoveredAt: null,
+        remark: '新购仪器已开领用单，待上站安装',
+        createdAt: now,
+        updatedAt: now,
+      });
+      instrumentRows.push(
+        {
+          id: 'ins_wh_01',
+          stationId: null,
+          type: '宽频带',
+          model: 'CMG-3ESPC',
+          serialNo: 'CMG-3E-20250601-99',
+          installDate: null,
+          state: '在用',
+          logisticsState: '已发料',
+          stockInDate: daysAgo(40),
+          requisitionNo: openReqNo,
+          remark: '已开领用单，待上站',
+          ...stamp(600),
+        },
+        {
+          id: 'ins_wh_02',
+          stationId: null,
+          type: '强震',
+          model: 'ES-T',
+          serialNo: 'EST-20250715-12',
+          installDate: null,
+          state: '在用',
+          logisticsState: '在库',
+          stockInDate: daysAgo(20),
+          requisitionNo: null,
+          remark: '在库备份',
+          ...stamp(601),
+        },
+        {
+          id: 'ins_wh_03',
+          stationId: null,
+          type: '短周期',
+          model: 'FSS-3B',
+          serialNo: 'FSS3B-20250820-31',
+          installDate: null,
+          state: '在用',
+          logisticsState: '排队',
+          stockInDate: daysAgo(5),
+          requisitionNo: null,
+          remark: '库容排不下，等下一批',
+          ...stamp(602),
+        }
+      );
+
+      // 演示一笔对不上：中心侧有安装位，但库房无对应领用单
+      installationRows.push({
+        id: createId('ist'),
+        stationId: 'stn_ltx_03',
+        stationCode: 'LTX03',
+        serialNo: 'UNKNOWN-001',
+        installDate: '2023-09-02',
+        requisitionNo: null,
+        state: '在装',
+        acknowledged: false,
+        acknowledgedAt: null,
+        remark: '中心侧有安装位，库房无对应领用单（演示差异）',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // 按台站码 + 序列号对账，生成对账记录
+      const reconciliationRows = computeReconciliation({
+        installations: installationRows,
+        requisitions: requisitionRows,
+        now,
+      });
+
       await db.arrays.bulkPut(arrayRows);
       await db.stations.bulkPut(stationRows);
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.requisitions.bulkPut(requisitionRows);
+      await db.installations.bulkPut(installationRows);
+      await db.reconciliations.bulkPut(reconciliationRows);
     }
   );
 }
@@ -555,7 +835,16 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.requisitions,
+      db.installations,
+      db.reconciliations,
+    ],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +852,9 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.requisitions.clear(),
+        db.installations.clear(),
+        db.reconciliations.clear(),
       ]);
     }
   );
@@ -576,14 +868,18 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.count(),
-    db.stations.count(),
-    db.instruments.count(),
-    db.calibrations.count(),
-    db.replaces.count(),
-  ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  const [arrays, stations, instruments, calibrations, replaces, requisitions, installations, reconciliations] =
+    await Promise.all([
+      db.arrays.count(),
+      db.stations.count(),
+      db.instruments.count(),
+      db.calibrations.count(),
+      db.replaces.count(),
+      db.requisitions.count(),
+      db.installations.count(),
+      db.reconciliations.count(),
+    ]);
+  return { arrays, stations, instruments, calibrations, replaces, requisitions, installations, reconciliations };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

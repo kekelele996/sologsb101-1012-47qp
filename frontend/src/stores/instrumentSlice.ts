@@ -1,11 +1,12 @@
 /**
- * 仪器 slice：维护仪器列表、登记草稿与选中台站。
- * 序列号唯一性校验与「登记后自动生成下一次标定待办」在本 slice 的动作里完成。
+ * 仪器 slice：维护器材库在库仪器档案列表、入库草稿。
+ * 序列号唯一性校验在本 slice 的动作里完成；入库时按在库容量决定「在库 / 排队」。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
-import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
-import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import type { Instrument, InstrumentDraft, InstrumentState, LogisticsState } from '@/types/instrument';
+import { createEmptyInstrumentDraft } from '@/types/instrument';
+import { getWarehouseCapacity } from '@/types/warehouse';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -15,9 +16,7 @@ export interface InstrumentSliceState {
   instruments: Instrument[];
   ready: boolean;
   error: string | null;
-  /** 当前选中的台站（台站仪器页上下文） */
-  currentStationId: string | null;
-  /** 仪器登记草稿（跨页面保留） */
+  /** 仪器入库草稿（跨页面保留） */
   draft: InstrumentDraft;
   /** 最近一次保存回执（用于页面提示） */
   lastReceipt: string;
@@ -27,7 +26,6 @@ const initialState: InstrumentSliceState = {
   instruments: [],
   ready: false,
   error: null,
-  currentStationId: null,
   draft: createEmptyInstrumentDraft(),
   lastReceipt: '',
 };
@@ -41,6 +39,12 @@ export async function findSerialConflict(
   return rows.find((row) => row.id !== excludeId);
 }
 
+/** 盘点当前在库（含已发料未上站）仪器数量，用于入库容量控制 */
+export async function countStockedInstruments(): Promise<number> {
+  const rows = await db.instruments.toArray();
+  return rows.filter((row) => row.logisticsState === '在库' || row.logisticsState === '已发料').length;
+}
+
 export const createInstrument = createAsyncThunk(
   'instrument/createInstrument',
   async (
@@ -52,11 +56,15 @@ export const createInstrument = createAsyncThunk(
       return rejectWithValue(`序列号「${payload.serialNo}」已被仪器 ${conflict.model} 占用`);
     }
     const now = Date.now();
-    const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
+    // 未指定物流状态时，按在库容量决定：排不下先排队等下一批
+    let logisticsState: LogisticsState = payload.logisticsState ?? '在库';
+    if (!payload.logisticsState) {
+      const stocked = await countStockedInstruments();
+      logisticsState = stocked >= getWarehouseCapacity() ? '排队' : '在库';
+    }
+    const row: Instrument = { ...payload, logisticsState, id: createId('ins'), createdAt: now, updatedAt: now };
     await db.instruments.put(row);
-    // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
-    const dueInDays = daysUntilDue(null, row.installDate);
-    return { row, dueInDays };
+    return { row };
   }
 );
 
@@ -77,15 +85,23 @@ export const updateInstrument = createAsyncThunk(
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器档案：级联删除标定、更换记录与台网中心安装位 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.installations],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        const instrument = await db.instruments.get(instrumentId);
+        if (instrument) {
+          await db.installations.where('serialNo').equals(instrument.serialNo).delete();
+        }
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );
@@ -131,15 +147,11 @@ const instrumentSlice = createSlice({
     setInstrumentError(state, action: PayloadAction<string | null>) {
       state.error = action.payload;
     },
-    selectStationForInstrument(state, action: PayloadAction<string | null>) {
-      state.currentStationId = action.payload;
-      state.draft.stationId = action.payload ?? '';
-    },
     patchDraft(state, action: PayloadAction<Partial<InstrumentDraft>>) {
       state.draft = { ...state.draft, ...action.payload };
     },
     resetDraft(state) {
-      state.draft = { ...createEmptyInstrumentDraft(), stationId: state.currentStationId ?? '' };
+      state.draft = createEmptyInstrumentDraft();
     },
     setReceipt(state, action: PayloadAction<string>) {
       state.lastReceipt = action.payload;
@@ -148,15 +160,15 @@ const instrumentSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(createInstrument.fulfilled, (state, action) => {
-        const dueInDays = action.payload.dueInDays;
+        const { row } = action.payload;
         state.lastReceipt =
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天，请按期安排标定`
-            : `仪器已登记，但安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`;
+          row.logisticsState === '排队'
+            ? `仪器 ${row.serialNo} 已入库登记，但在库容量已满，先排队等下一批`
+            : `仪器 ${row.serialNo} 已入库（在库），可随时按台站码开领用单上站`;
         state.error = null;
       })
       .addCase(createInstrument.rejected, (state, action) => {
-        state.error = typeof action.payload === 'string' ? action.payload : '仪器登记失败';
+        state.error = typeof action.payload === 'string' ? action.payload : '仪器入库失败';
       })
       .addCase(updateInstrument.rejected, (state, action) => {
         state.error = typeof action.payload === 'string' ? action.payload : '仪器更新失败';
@@ -170,7 +182,6 @@ const instrumentSlice = createSlice({
 export const {
   setInstruments,
   setInstrumentError,
-  selectStationForInstrument,
   patchDraft,
   resetDraft,
   setReceipt,
@@ -210,11 +221,11 @@ export const selectInstrumentsOfStation = (
     .sort((a, b) => a.type.localeCompare(b.type, 'zh-Hans-CN') || a.model.localeCompare(b.model));
 };
 
-/** 台站 id → 仪器台数 */
+/** 台站 id → 仪器台数（仅统计已回显台站的在装仪器） */
 export const selectInstrumentCountsByStation = (state: WithInstrument): Record<string, number> => {
   const counts: Record<string, number> = {};
   state.instrument.instruments.forEach((row) => {
-    counts[row.stationId] = (counts[row.stationId] ?? 0) + 1;
+    if (row.stationId) counts[row.stationId] = (counts[row.stationId] ?? 0) + 1;
   });
   return counts;
 };

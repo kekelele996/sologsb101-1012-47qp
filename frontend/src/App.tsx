@@ -10,6 +10,8 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   GlobalOutlined,
+  InboxOutlined,
+  SafetyCertificateOutlined,
   SwapOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
@@ -30,6 +32,11 @@ import {
   selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import {
+  selectRequisitions,
+  selectReconciliations,
+  startWarehouseSubscription,
+} from '@/stores/warehouseSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -38,6 +45,8 @@ const { Header, Sider, Content, Footer } = Layout;
 function buildSelectedKey(pathname: string, currentArrayId: string | null): string {
   if (pathname.startsWith('/calibrations')) return ROUTES.calibrations;
   if (pathname.startsWith('/replacements')) return ROUTES.replacements;
+  if (pathname.startsWith('/warehouse')) return ROUTES.warehouse;
+  if (pathname.startsWith('/reconciliation')) return ROUTES.reconciliation;
   if (pathname.startsWith('/geometry')) return ROUTES.geometry;
   if (pathname.startsWith('/stations/') && currentArrayId) return ROUTES.stations(currentArrayId);
   return ROUTES.arrays;
@@ -54,6 +63,8 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const requisitions = useAppSelector(selectRequisitions);
+  const reconciliations = useAppSelector(selectReconciliations);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +78,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startWarehouseSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -83,6 +95,7 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const pendingReconcile = reconciliations.filter((row) => row.result === '待确认').length;
 
   return (
     <>
@@ -118,6 +131,12 @@ export default function App() {
               },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
               { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+              { key: ROUTES.warehouse, icon: <InboxOutlined />, label: '器材库台账' },
+              {
+                key: ROUTES.reconciliation,
+                icon: <SafetyCertificateOutlined />,
+                label: `对账台${pendingReconcile > 0 ? `（${pendingReconcile}）` : ''}`,
+              },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
           />
@@ -127,10 +146,13 @@ export default function App() {
                 <AppstoreOutlined /> 台阵 {arrays.length} · 台站 {stations.length}
               </span>
               <span>
-                <ExperimentOutlined /> 仪器 {instruments.length}
+                <ExperimentOutlined /> 仪器 {instruments.length} · 领用单 {requisitions.length}
               </span>
               <span>
                 <ThunderboltOutlined /> 标定 {calibrations.length} · 不合格 {unqualified}
+              </span>
+              <span>
+                <SafetyCertificateOutlined /> 对账待确认 {pendingReconcile}
               </span>
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}

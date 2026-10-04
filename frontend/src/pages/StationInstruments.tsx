@@ -1,6 +1,7 @@
 /**
  * 模块 2：/stations/:id/instruments 台站仪器登记与安装位置维护
- * 序列号唯一性校验；深链访问时台阵不存在给出友好空态。
+ * 台网中心管台站名册与仪器安装位：要上仪器时按台站码开领用单，库房照单发料，
+ * 安装位留痕（序列号 / 安装日期 / 领用单号 / 认下状态）。
  * 复用 <StatBadge>、<QualifyTag>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -44,32 +45,25 @@ import {
   selectArrayById,
   selectArrayReady,
   selectArrays,
+  selectInstallationCountsByStation,
+  selectInstallations,
+  selectInstallationsOfStation,
   selectStationFilter,
   selectStationsOfArray,
+  updateInstallationPosition,
   updateStation,
 } from '@/stores/arraySlice';
-import {
-  bulkSetInstrumentState,
-  createInstrument,
-  patchDraft,
-  removeInstrument,
-  resetDraft,
-  selectInstruments,
-  selectInstrumentsOfStation,
-  updateInstrument,
-} from '@/stores/instrumentSlice';
+import { selectInstruments } from '@/stores/instrumentSlice';
+import { bulkSetInstrumentState } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
-import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
-  COMMON_MODELS,
-  INSTRUMENT_STATES,
-  INSTRUMENT_TYPES,
-  createEmptyInstrumentDraft,
-  daysUntilDue,
-  type Instrument,
-  type InstrumentState,
-  type InstrumentType,
-} from '@/types/instrument';
+  installInstrumentAtStation,
+  recoverRequisition,
+  selectRequisitions,
+} from '@/stores/warehouseSlice';
+import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
+import { daysUntilDue, type Instrument } from '@/types/instrument';
+import type { Installation } from '@/types/installation';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -82,19 +76,16 @@ interface StationFormValues {
   siteNote: string;
 }
 
-interface InstrumentFormValues {
-  type: InstrumentType;
-  model: string;
+interface InstallFormValues {
   serialNo: string;
   installDate: dayjs.Dayjs | null;
-  state: InstrumentState;
   remark: string;
 }
 
-/** 台站行统计：仪器数、标定数、不合格数与超期台数 */
+/** 台站行统计：安装位数、标定数、不合格数与超期台数 */
 interface StationRow {
   station: SeisStation;
-  instruments: Instrument[];
+  installations: Installation[];
   calibrationCount: number;
   unqualified: number;
   overdue: number;
@@ -113,17 +104,20 @@ export default function StationInstruments() {
   const stations = useAppSelector((state) => selectStationsOfArray(state, arrayId));
   const stationFilter = useAppSelector(selectStationFilter);
   const allInstruments = useAppSelector(selectInstruments);
+  const allInstallations = useAppSelector(selectInstallations);
+  const requisitions = useAppSelector(selectRequisitions);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const installationCounts = useAppSelector(selectInstallationCountsByStation);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
-  const [instrumentModalOpen, setInstrumentModalOpen] = useState(false);
-  const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
+  const [installModalOpen, setInstallModalOpen] = useState(false);
+  const [editingInstallationId, setEditingInstallationId] = useState<string | null>(null);
   const [activeStationId, setActiveStationId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [stationForm] = Form.useForm<StationFormValues>();
-  const [instrumentForm] = Form.useForm<InstrumentFormValues>();
+  const [installForm] = Form.useForm<InstallFormValues>();
 
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
@@ -134,11 +128,24 @@ export default function StationInstruments() {
     [activeStationId, stations]
   );
 
-  const activeInstruments = useAppSelector((state) =>
-    selectInstrumentsOfStation(state, activeStationId)
+  const activeInstallations = useAppSelector((state) =>
+    selectInstallationsOfStation(state, activeStationId)
   );
 
-  /** 台站行：附带仪器、标定与超期统计 */
+  /** 序列号 → 仪器档案（类型 / 型号 / 标定id） */
+  const instrumentBySerial = useMemo(() => {
+    const map = new Map<string, Instrument>();
+    allInstruments.forEach((row) => map.set(row.serialNo, row));
+    return map;
+  }, [allInstruments]);
+
+  /** 在库可发料仪器（登记安装位时选） */
+  const inStockInstruments = useMemo(
+    () => allInstruments.filter((row) => row.logisticsState === '在库'),
+    [allInstruments]
+  );
+
+  /** 台站行：附带安装位、标定与超期统计 */
   const rows = useMemo<StationRow[]>(
     () =>
       stations
@@ -149,44 +156,50 @@ export default function StationInstruments() {
           }
           if (stationFilter.bedrocks.length > 0 && !stationFilter.bedrocks.includes(station.bedrock)) return false;
           if (stationFilter.minElevM !== null && station.elevM < stationFilter.minElevM) return false;
-          const count = allInstruments.filter((instrument) => instrument.stationId === station.id).length;
+          const count = installationCounts[station.id] ?? 0;
           if (stationFilter.onlyEmpty && count > 0) return false;
           return true;
         })
         .map((station) => {
-          const stationInstruments = allInstruments.filter(
-            (instrument) => instrument.stationId === station.id
+          const stationInstallations = allInstallations
+            .filter((row) => row.stationId === station.id && row.state === '在装')
+            .sort((a, b) => b.installDate.localeCompare(a.installDate));
+          const stationInstrumentIds = new Set(
+            stationInstallations
+              .map((row) => instrumentBySerial.get(row.serialNo)?.id)
+              .filter((id): id is string => !!id)
           );
-          const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
           const stationCalibrations = calibrations.filter((calibration) =>
-            instrumentIds.has(calibration.instrumentId)
+            stationInstrumentIds.has(calibration.instrumentId)
           );
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
-          const overdue = stationInstruments.filter((instrument) => {
+          const overdue = stationInstallations.filter((installation) => {
+            const instrument = instrumentBySerial.get(installation.serialNo);
+            if (!instrument) return false;
             const own = calibrations
               .filter((calibration) => calibration.instrumentId === instrument.id)
               .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
+            const last = own.length > 0 ? own[0].date : installation.installDate;
+            return daysUntilDue(last, installation.installDate) < 0;
           }).length;
           return {
             station,
-            instruments: stationInstruments,
+            installations: stationInstallations,
             calibrationCount: stationCalibrations.length,
             unqualified,
             overdue,
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, allInstallations, calibrations, installationCounts, stationFilter, stations, instrumentBySerial]
   );
 
   const totals = useMemo(
     () => ({
       stations: rows.length,
-      instruments: rows.reduce((sum, row) => sum + row.instruments.length, 0),
+      instruments: rows.reduce((sum, row) => sum + row.installations.length, 0),
       calibrations: rows.reduce((sum, row) => sum + row.calibrationCount, 0),
       unqualified: rows.reduce((sum, row) => sum + row.unqualified, 0),
       overdue: rows.reduce((sum, row) => sum + row.overdue, 0),
@@ -264,86 +277,99 @@ export default function StationInstruments() {
     }
   };
 
-  const openInstrumentCreate = (station: SeisStation) => {
+  const openInstallCreate = (station: SeisStation) => {
     setActiveStationId(station.id);
-    setEditingInstrumentId(null);
-    dispatch(resetDraft());
-    const draft = { ...createEmptyInstrumentDraft(), stationId: station.id };
-    dispatch(patchDraft(draft));
-    instrumentForm.setFieldsValue({
-      type: draft.type,
-      model: COMMON_MODELS[draft.type][0] ?? '',
-      serialNo: `${station.code}-${Date.now().toString(36).toUpperCase().slice(-4)}`,
+    setEditingInstallationId(null);
+    installForm.setFieldsValue({
+      serialNo: undefined,
       installDate: dayjs(),
-      state: '在用',
       remark: '',
     });
-    setInstrumentModalOpen(true);
+    setInstallModalOpen(true);
   };
 
-  const openInstrumentEdit = (station: SeisStation, instrument: Instrument) => {
+  const openInstallEdit = (station: SeisStation, installation: Installation) => {
     setActiveStationId(station.id);
-    setEditingInstrumentId(instrument.id);
-    instrumentForm.setFieldsValue({
-      type: instrument.type,
-      model: instrument.model,
-      serialNo: instrument.serialNo,
-      installDate: dayjs(instrument.installDate),
-      state: instrument.state,
-      remark: instrument.remark,
+    setEditingInstallationId(installation.id);
+    installForm.setFieldsValue({
+      serialNo: installation.serialNo,
+      installDate: dayjs(installation.installDate),
+      remark: installation.remark,
     });
-    setInstrumentModalOpen(true);
+    setInstallModalOpen(true);
   };
 
-  const submitInstrument = async () => {
-    if (!activeStationId) {
+  const submitInstall = async () => {
+    if (!activeStationId || !activeStation) {
       message.warning('请先选择一个台站');
       return;
     }
-    const values = await instrumentForm.validateFields();
+    const values = await installForm.validateFields();
     setSubmitting(true);
     try {
-      const payload = {
-        stationId: activeStationId,
-        type: values.type,
-        model: values.model.trim(),
-        serialNo: values.serialNo.trim(),
-        installDate: values.installDate ? values.installDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
-        state: values.state,
-        remark: values.remark?.trim() ?? '',
-      };
-      if (editingInstrumentId) {
-        await dispatch(updateInstrument({ id: editingInstrumentId, patch: payload })).unwrap();
-        message.success('仪器信息已更新');
+      if (editingInstallationId) {
+        await dispatch(
+          updateInstallationPosition({
+            id: editingInstallationId,
+            patch: {
+              installDate: values.installDate ? values.installDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+              remark: values.remark?.trim() ?? '',
+            },
+          })
+        ).unwrap();
+        message.success('安装位已更新');
       } else {
-        await dispatch(createInstrument(payload)).unwrap();
-        dispatch(patchDraft(payload));
-        const dueInDays = daysUntilDue(null, payload.installDate);
-        message.success(
-          dueInDays >= 0
-            ? `仪器已登记，距下次标定 ${dueInDays} 天`
-            : `仪器已登记，安装日期距今已超过标定周期 ${Math.abs(dueInDays)} 天，请尽快安排标定`
-        );
+        await dispatch(
+          installInstrumentAtStation({
+            stationId: activeStationId,
+            serialNo: values.serialNo,
+            installDate: values.installDate ? values.installDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+            remark: values.remark?.trim() ?? '',
+          })
+        ).unwrap();
+        message.success('已按台站码开领用单并发料上站，安装位已登记');
       }
-      setInstrumentModalOpen(false);
+      setInstallModalOpen(false);
     } catch (error) {
-      message.error(typeof error === 'string' ? error : '仪器保存失败');
+      message.error(typeof error === 'string' ? error : '上站失败');
     } finally {
       setSubmitting(false);
     }
   };
 
-  const handleBulkPending = async () => {
-    const ids = Array.from(new Set(allInstruments.map((instrument) => instrument.id)));
-    const targetIds = ids.filter((id) =>
-      rows.some((row) => row.instruments.some((instrument) => instrument.id === id))
+  /** 拆除：回收该序列号未回收领用单（安装位拆回、仪器回库待验） */
+  const handleRecover = async (installation: Installation) => {
+    const open = requisitions.find(
+      (row) => row.serialNo === installation.serialNo && row.state === '已发料'
     );
-    if (targetIds.length === 0) {
+    if (!open) {
+      message.warning('该序列号没有未回收的领用单');
+      return;
+    }
+    try {
+      await dispatch(recoverRequisition(open.id)).unwrap();
+      message.success('领用单已回收，安装位已拆回，仪器回库待验');
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '回收失败');
+    }
+  };
+
+  const handleBulkPending = async () => {
+    const ids = Array.from(
+      new Set(
+        rows.flatMap((row) =>
+          row.installations
+            .map((installation) => instrumentBySerial.get(installation.serialNo)?.id)
+            .filter((id): id is string => !!id)
+        )
+      )
+    );
+    if (ids.length === 0) {
       message.warning('当前筛选范围内没有可批量操作的仪器');
       return;
     }
-    await dispatch(bulkSetInstrumentState({ ids: targetIds, state: '待标定' })).unwrap();
-    message.success(`已将 ${targetIds.length} 台仪器状态置为待标定`);
+    await dispatch(bulkSetInstrumentState({ ids, state: '待标定' })).unwrap();
+    message.success(`已将 ${ids.length} 台仪器状态置为待标定`);
   };
 
   if (!ready) {
@@ -383,8 +409,7 @@ export default function StationInstruments() {
             {array.name} · 台站仪器登记
           </Typography.Title>
           <p className="gb-hint">
-            维护台站地理坐标与基岩类型并登记仪器；序列号全局唯一，登记后自动生成下一次标定待办（周期
-            365 天）。
+            台网中心管台站名册与仪器安装位；要上仪器时按台站码开领用单，库房照单发料，同一台仪器不能同时挂在两张没回收的单上。
           </p>
         </div>
         <Space wrap>
@@ -407,7 +432,7 @@ export default function StationInstruments() {
 
       <div className="gb-stats-row">
         <StatBadge label="台站数" value={totals.stations} suffix="个" tone="info" />
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge label="在装仪器" value={totals.instruments} suffix="台" tone="primary" />
         <StatBadge label="累计标定" value={totals.calibrations} suffix="次" tone="default" />
         <StatBadge
           label="不合格标定"
@@ -453,7 +478,7 @@ export default function StationInstruments() {
       {rows.length === 0 ? (
         <EmptyPanel
           title={stations.length === 0 ? '该台阵还没有台站' : '没有符合条件的台站'}
-          description="新增台站并录入经纬度、高程与基岩类型后，即可登记仪器并录入标定结果。"
+          description="新增台站并录入经纬度、高程与基岩类型后，即可开领用单上仪器并登记安装位。"
           actionText="新增台站"
           secondaryText="重置筛选"
           onAction={openStationCreate}
@@ -495,12 +520,12 @@ export default function StationInstruments() {
               render: (_: unknown, row: StationRow) => <Tag>{row.station.bedrock}</Tag>,
             },
             {
-              title: '仪器台数',
+              title: '在装仪器',
               width: 110,
               align: 'center',
               render: (_: unknown, row: StationRow) => (
                 <Button type="link" size="small" onClick={() => setActiveStationId(row.station.id)}>
-                  {row.instruments.length} 台
+                  {row.installations.length} 台
                 </Button>
               ),
             },
@@ -532,15 +557,15 @@ export default function StationInstruments() {
               width: 250,
               render: (_: unknown, row: StationRow) => (
                 <Space size={6}>
-                  <Button size="small" type="primary" onClick={() => openInstrumentCreate(row.station)}>
-                    登记仪器
+                  <Button size="small" type="primary" onClick={() => openInstallCreate(row.station)}>
+                    上仪器
                   </Button>
                   <Button size="small" icon={<EditOutlined />} onClick={() => openStationEdit(row.station)}>
                     编辑
                   </Button>
                   <Popconfirm
                     title="删除台站"
-                    description={`将同时删除其仪器、标定与更换记录，确认删除「${row.station.code}」？`}
+                    description="将同时删除其仪器、标定、更换记录与安装位，确认删除「{row.station.code}」？"
                     okText="删除"
                     cancelText="取消"
                     okButtonProps={{ danger: true }}
@@ -565,19 +590,19 @@ export default function StationInstruments() {
         <Card
           className="gb-panel"
           size="small"
-          title={`${activeStation.code} · 仪器清单（${activeInstruments.length} 台）`}
+          title={`${activeStation.code} · 安装位清单（${activeInstallations.length} 台）`}
           extra={
-            <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => openInstrumentCreate(activeStation)}>
-              登记仪器
+            <Button type="primary" size="small" icon={<PlusOutlined />} onClick={() => openInstallCreate(activeStation)}>
+              上仪器
             </Button>
           }
         >
-          {activeInstruments.length === 0 ? (
+          {activeInstallations.length === 0 ? (
             <EmptyPanel
-              title="该台站还没有仪器"
-              description="登记宽频带 / 短周期 / 强震仪器，序列号需全局唯一。"
-              actionText="登记仪器"
-              onAction={() => openInstrumentCreate(activeStation)}
+              title="该台站还没有安装位"
+              description="选择器材库中在库的仪器，按台站码开领用单上站，安装位自动留痕。"
+              actionText="上仪器"
+              onAction={() => openInstallCreate(activeStation)}
               compact
             />
           ) : (
@@ -585,47 +610,75 @@ export default function StationInstruments() {
               rowKey="id"
               size="small"
               className="gb-table-compact"
-              dataSource={activeInstruments}
+              dataSource={activeInstallations}
               pagination={false}
               columns={[
-                { title: '类型', dataIndex: 'type', width: 100, render: (value: string) => <Tag>{value}</Tag> },
-                { title: '型号', dataIndex: 'model', width: 160 },
                 {
                   title: '序列号',
                   dataIndex: 'serialNo',
-                  width: 220,
+                  width: 200,
                   render: (value: string) => <span className="gb-mono">{value}</span>,
+                },
+                {
+                  title: '类型 / 型号',
+                  width: 180,
+                  render: (_: unknown, installation: Installation) => {
+                    const instrument = instrumentBySerial.get(installation.serialNo);
+                    return instrument ? (
+                      <span>
+                        <Tag>{instrument.type}</Tag>
+                        {instrument.model}
+                      </span>
+                    ) : (
+                      <span className="gb-hint">档案缺失</span>
+                    );
+                  },
                 },
                 { title: '安装日期', dataIndex: 'installDate', width: 120, className: 'gb-mono' },
                 {
+                  title: '领用单号',
+                  dataIndex: 'requisitionNo',
+                  width: 200,
+                  render: (v: string | null) => (v ? <span className="gb-mono">{v}</span> : <span className="gb-hint">补单缺失</span>),
+                },
+                {
                   title: '状态',
                   dataIndex: 'state',
-                  width: 100,
-                  render: (value: string) => (
-                    <Tag color={value === '在用' ? 'green' : value === '待标定' ? 'orange' : 'default'}>{value}</Tag>
-                  ),
+                  width: 90,
+                  render: (value: string) => <Tag color={value === '在装' ? 'green' : 'default'}>{value}</Tag>,
+                },
+                {
+                  title: '认下',
+                  dataIndex: 'acknowledged',
+                  width: 90,
+                  render: (acknowledged: boolean) =>
+                    acknowledged ? <Tag color="green">已认下</Tag> : <Tag>未认下</Tag>,
                 },
                 {
                   title: '标定次数',
-                  width: 100,
+                  width: 90,
                   align: 'right',
-                  render: (_: unknown, instrument: Instrument) => (
-                    <span className="gb-mono">
-                      {calibrations.filter((row) => row.instrumentId === instrument.id).length}
-                    </span>
-                  ),
+                  render: (_: unknown, installation: Installation) => {
+                    const instrument = instrumentBySerial.get(installation.serialNo);
+                    if (!instrument) return <span className="gb-mono">0</span>;
+                    return (
+                      <span className="gb-mono">
+                        {calibrations.filter((row) => row.instrumentId === instrument.id).length}
+                      </span>
+                    );
+                  },
                 },
                 {
                   title: '最近结论',
-                  width: 180,
-                  render: (_: unknown, instrument: Instrument) => {
+                  width: 170,
+                  render: (_: unknown, installation: Installation) => {
+                    const instrument = instrumentBySerial.get(installation.serialNo);
+                    if (!instrument) return <span className="gb-hint">尚未标定</span>;
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
                     const latest = own[0];
-                    if (!latest) {
-                      return <span className="gb-hint">尚未标定</span>;
-                    }
+                    if (!latest) return <span className="gb-hint">尚未标定</span>;
                     return (
                       <QualifyTag
                         verdict={latest.responseVerdict}
@@ -638,12 +691,14 @@ export default function StationInstruments() {
                 {
                   title: '距下次标定',
                   width: 130,
-                  render: (_: unknown, instrument: Instrument) => {
+                  render: (_: unknown, installation: Installation) => {
+                    const instrument = instrumentBySerial.get(installation.serialNo);
+                    if (!instrument) return <span className="gb-hint">—</span>;
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
-                    const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const last = own.length > 0 ? own[0].date : installation.installDate;
+                    const days = daysUntilDue(last, installation.installDate);
                     return (
                       <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
                         {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
@@ -653,28 +708,26 @@ export default function StationInstruments() {
                 },
                 {
                   title: '操作',
-                  width: 190,
-                  render: (_: unknown, instrument: Instrument) => (
+                  width: 150,
+                  render: (_: unknown, installation: Installation) => (
                     <Space size={6}>
-                      <Button size="small" onClick={() => openInstrumentEdit(activeStation, instrument)}>
+                      <Button size="small" onClick={() => openInstallEdit(activeStation, installation)}>
                         编辑
                       </Button>
-                      <Popconfirm
-                        title="删除仪器"
-                        description={`将同时删除其标定与更换记录，确认删除「${instrument.model}」？`}
-                        okText="删除"
-                        cancelText="取消"
-                        okButtonProps={{ danger: true }}
-                        onConfirm={() =>
-                          void dispatch(removeInstrument(instrument.id))
-                            .unwrap()
-                            .then(() => message.success('仪器及其记录已删除'))
-                        }
-                      >
-                        <Button size="small" danger>
-                          删除
-                        </Button>
-                      </Popconfirm>
+                      {installation.state === '在装' ? (
+                        <Popconfirm
+                          title="拆回仪器"
+                          description="回收该序列号的领用单，安装位置为已拆回，仪器回库待验，确认拆回？"
+                          okText="拆回"
+                          cancelText="取消"
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => void handleRecover(installation)}
+                        >
+                          <Button size="small" danger>
+                            拆回
+                          </Button>
+                        </Popconfirm>
+                      ) : null}
                     </Space>
                   ),
                 },
@@ -685,16 +738,16 @@ export default function StationInstruments() {
       ) : (
         <Card className="gb-panel" size="small">
           <EmptyPanel
-            title="请选择台站查看仪器"
-            description="在上表点击任一「仪器台数」或「登记仪器」按钮，即可查看与维护该台站的仪器。"
+            title="请选择台站查看安装位"
+            description="在上表点击任一「在装仪器」或「上仪器」按钮，即可查看与维护该台站的安装位。"
             compact
           />
         </Card>
       )}
 
       <p className="gb-hint">
-        更换提醒：当仪器标定超期或结论不合格时，可到「合格评定与更换」页登记更换并跟踪到复核闭环；
-        更换完成后将自动把新序列号回写到仪器档案。当前共 {replaces.length} 条更换记录。
+        对账：台网中心安装位与器材库领用单按台站码 + 序列号对账，对不上先摆着等确认，中心认下的不退回。
+        当前共 {replaces.length} 条更换记录。
       </p>
 
       <Modal
@@ -741,49 +794,47 @@ export default function StationInstruments() {
       </Modal>
 
       <Modal
-        open={instrumentModalOpen}
-        title={`${editingInstrumentId ? '编辑' : '登记'}仪器 · ${activeStation?.code ?? ''}`}
-        onCancel={() => setInstrumentModalOpen(false)}
-        onOk={() => void submitInstrument()}
+        open={installModalOpen}
+        title={`${editingInstallationId ? '编辑安装位' : '上仪器'} · ${activeStation?.code ?? ''}`}
+        onCancel={() => setInstallModalOpen(false)}
+        onOk={() => void submitInstall()}
         confirmLoading={submitting}
-        okText={editingInstrumentId ? '保存修改' : '登记并生成待办'}
+        okText={editingInstallationId ? '保存修改' : '开单上站'}
         destroyOnClose
       >
-        <Form form={instrumentForm} layout="vertical" preserve={false}>
-          <Form.Item name="type" label="仪器类型" rules={[{ required: true }]}>
-            <Select
-              options={INSTRUMENT_TYPES.map((type) => ({ label: type, value: type }))}
-              onChange={(value: InstrumentType) => {
-                const models = COMMON_MODELS[value] ?? [];
-                instrumentForm.setFieldValue('model', models[0] ?? '');
-              }}
-            />
+        <Form form={installForm} layout="vertical" preserve={false}>
+          {!editingInstallationId ? (
+            <Form.Item
+              name="serialNo"
+              label="领用仪器（器材库在库）"
+              rules={[{ required: true, message: '请选择在库仪器' }]}
+            >
+              <Select
+                showSearch
+                placeholder="选择器材库在库仪器，按台站码开领用单"
+                optionFilterProp="label"
+                options={inStockInstruments.map((row) => ({
+                  label: `${row.serialNo} · ${row.type} ${row.model}`,
+                  value: row.serialNo,
+                }))}
+              />
+            </Form.Item>
+          ) : (
+            <Form.Item name="serialNo" label="序列号">
+              <Input disabled />
+            </Form.Item>
+          )}
+          <Form.Item name="installDate" label="安装（上站）日期" rules={[{ required: true }]}>
+            <DatePicker style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="model" label="型号" rules={[{ required: true, message: '请填写型号' }]}>
-            <Input placeholder="如：CMG-3ESPC" maxLength={40} />
-          </Form.Item>
-          <Form.Item
-            name="serialNo"
-            label="序列号（全局唯一）"
-            rules={[{ required: true, message: '请填写序列号' }]}
-          >
-            <Input placeholder="如：CMG-3E-20210418-01" maxLength={60} />
-          </Form.Item>
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="installDate" label="安装日期" rules={[{ required: true }]}>
-                <DatePicker style={{ width: '100%' }} />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="state" label="状态" rules={[{ required: true }]}>
-                <Select options={INSTRUMENT_STATES.map((state) => ({ label: state, value: state }))} />
-              </Form.Item>
-            </Col>
-          </Row>
           <Form.Item name="remark" label="备注">
             <Input.TextArea rows={2} maxLength={80} placeholder="如：井下安装，深度 42 m" />
           </Form.Item>
+          {!editingInstallationId ? (
+            <p className="gb-hint">
+              提交后按台站码生成领用单（库房照单发料），同一台仪器不能同时挂在两张没回收的单上；安装位同步留痕。
+            </p>
+          ) : null}
         </Form>
       </Modal>
     </div>

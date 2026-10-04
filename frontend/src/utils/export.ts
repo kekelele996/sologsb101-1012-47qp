@@ -15,20 +15,33 @@ import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'requisitions',
+  'installations',
+  'reconciliations',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
-    db.arrays.toArray(),
-    db.stations.toArray(),
-    db.instruments.toArray(),
-    db.calibrations.toArray(),
-    db.replaces.toArray(),
-  ]);
+  const [arrays, stations, instruments, calibrations, replaces, requisitions, installations, reconciliations] =
+    await Promise.all([
+      db.arrays.toArray(),
+      db.stations.toArray(),
+      db.instruments.toArray(),
+      db.calibrations.toArray(),
+      db.replaces.toArray(),
+      db.requisitions.toArray(),
+      db.installations.toArray(),
+      db.reconciliations.toArray(),
+    ]);
   return {
     app: 'gbseisarray',
     dbVersion: DB_VERSION,
@@ -38,6 +51,9 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    requisitions,
+    installations,
+    reconciliations,
   };
 }
 
@@ -68,6 +84,9 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    requisitions: obj.requisitions ?? [],
+    installations: obj.installations ?? [],
+    reconciliations: obj.reconciliations ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +99,9 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    requisitions: payload.requisitions.length,
+    installations: payload.installations.length,
+    reconciliations: payload.reconciliations.length,
   };
 }
 
@@ -117,13 +139,25 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [
+      db.arrays,
+      db.stations,
+      db.instruments,
+      db.calibrations,
+      db.replaces,
+      db.requisitions,
+      db.installations,
+      db.reconciliations,
+    ],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.requisitions.bulkPut(payload.requisitions);
+      await db.installations.bulkPut(payload.installations);
+      await db.reconciliations.bulkPut(payload.reconciliations);
     }
   );
   return countPayload(payload);
@@ -134,6 +168,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const arrayMap = new Map<string, string>();
   const stationMap = new Map<string, string>();
   const instrumentMap = new Map<string, string>();
+  const installationMap = new Map<string, string>();
+  const requisitionMap = new Map<string, string>();
 
   const arrays = payload.arrays.map((row) => {
     const id = createId('arr');
@@ -148,7 +184,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const instruments = payload.instruments.map((row) => {
     const id = createId('ins');
     instrumentMap.set(row.id, id);
-    return { ...row, id, stationId: stationMap.get(row.stationId) ?? row.stationId };
+    return { ...row, id, stationId: row.stationId ? stationMap.get(row.stationId) ?? row.stationId : null };
   });
   const calibrations = payload.calibrations.map((row) => ({
     ...row,
@@ -160,7 +196,37 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const requisitions = payload.requisitions.map((row) => {
+    const id = createId('lyr');
+    requisitionMap.set(row.id, id);
+    return { ...row, id };
+  });
+  const installations = payload.installations.map((row) => {
+    const id = createId('ist');
+    installationMap.set(row.id, id);
+    return {
+      ...row,
+      id,
+      stationId: stationMap.get(row.stationId) ?? row.stationId,
+    };
+  });
+  const reconciliations = payload.reconciliations.map((row) => ({
+    ...row,
+    id: createId('rec'),
+    installationId: row.installationId ? installationMap.get(row.installationId) ?? row.installationId : null,
+    requisitionId: row.requisitionId ? requisitionMap.get(row.requisitionId) ?? row.requisitionId : null,
+  }));
+  return {
+    ...payload,
+    arrays,
+    stations,
+    instruments,
+    calibrations,
+    replaces,
+    requisitions,
+    installations,
+    reconciliations,
+  };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -197,7 +263,9 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
   return payload.arrays.map((array) => {
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
-    const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
+    const instruments = payload.instruments.filter(
+      (instrument) => instrument.stationId != null && stationIds.has(instrument.stationId)
+    );
     const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
     const calibrations = payload.calibrations.filter((calibration) =>
       instrumentIds.has(calibration.instrumentId)
@@ -227,6 +295,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
       const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
+      if (!lastDate) return false; // 在库 / 排队仪器未上站，不参与超期评定
       const lastTime = Date.parse(`${lastDate}T00:00:00`);
       if (!Number.isFinite(lastTime)) return true;
       return today - lastTime > 365 * 86400000;
